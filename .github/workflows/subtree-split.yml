@@ -1,24 +1,32 @@
-name: Subtree Split & Auto Publish
+name: Auto Subtree Split & Publish
 
 on:
   push:
     branches:
-      - main
-      - master
+      - main-node
+      - main-php
+      - main-* # Support semua main-* branches
   workflow_dispatch:
+    inputs:
+      package:
+        description: "Package to split (node, php, python, go)"
+        required: true
+        type: choice
+        options:
+          - node
+          - php
+          - python
+          - go
 
 jobs:
-  subtree-split:
+  detect-and-split:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        package:
-          - name: php
-            path: php
-            repo: subtree-split-test-php
-          - name: node
-            path: node
-            repo: subtree-split-test-node
+    outputs:
+      package_name: ${{ steps.detect.outputs.package_name }}
+      package_path: ${{ steps.detect.outputs.package_path }}
+      repo_name: ${{ steps.detect.outputs.repo_name }}
+      should_publish: ${{ steps.detect.outputs.should_publish }}
+      version: ${{ steps.detect.outputs.version }}
 
     steps:
       - name: Checkout Code
@@ -26,6 +34,48 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.REPO_TOKEN }}
+
+      - name: Detect Package from Branch
+        id: detect
+        run: |
+          # Detect package dari branch name atau manual input
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PACKAGE="${{ github.event.inputs.package }}"
+          else
+            BRANCH_NAME="${{ github.ref_name }}"
+            PACKAGE="${BRANCH_NAME#main-}"  # Remove "main-" prefix
+          fi
+
+          echo "package_name=$PACKAGE" >> $GITHUB_OUTPUT
+          echo "package_path=$PACKAGE" >> $GITHUB_OUTPUT
+          echo "repo_name=subtree-split-test-$PACKAGE" >> $GITHUB_OUTPUT
+
+          # Check if should publish (jika ada version bump)
+          SHOULD_PUBLISH="false"
+          VERSION=""
+
+          if [ "$PACKAGE" = "node" ]; then
+            if [ -f "node/package.json" ]; then
+              VERSION=$(grep '"version"' node/package.json | head -1 | sed 's/.*"version": "\(.*\)".*/\1/')
+              echo "Detected Node version: $VERSION"
+            fi
+          elif [ "$PACKAGE" = "php" ]; then
+            # PHP version dari commit message atau generate dari date
+            VERSION=$(date +%Y.%m.%d.%H%M)
+            echo "Generated PHP version: $VERSION"
+          fi
+
+          if [ -n "$VERSION" ]; then
+            SHOULD_PUBLISH="true"
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+          fi
+
+          echo "should_publish=$SHOULD_PUBLISH" >> $GITHUB_OUTPUT
+
+          echo "📦 Detected Package: $PACKAGE"
+          echo "📁 Path: $PACKAGE"
+          echo "🔖 Version: $VERSION"
+          echo "🚀 Should Publish: $SHOULD_PUBLISH"
 
       - name: Setup Git Config
         run: |
@@ -36,9 +86,9 @@ jobs:
         id: check_repo
         run: |
           REPO_OWNER="${{ github.repository_owner }}"
-          REPO_NAME="${{ matrix.package.repo }}"
+          REPO_NAME="${{ steps.detect.outputs.repo_name }}"
 
-          echo "Checking repository: $REPO_OWNER/$REPO_NAME"
+          echo "🔍 Checking repository: $REPO_OWNER/$REPO_NAME"
 
           HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
             -H "Authorization: token ${{ secrets.REPO_TOKEN }}" \
@@ -46,22 +96,22 @@ jobs:
 
           if [ "$HTTP_STATUS" = "200" ]; then
             echo "exists=true" >> $GITHUB_OUTPUT
-            echo "Repository exists"
+            echo "✅ Repository exists"
           else
             echo "exists=false" >> $GITHUB_OUTPUT
-            echo "Repository does not exist"
+            echo "❌ Repository does not exist - will create"
           fi
 
-      - name: Create Remote Repository if Not Exists
+      - name: Create Remote Repository
         if: steps.check_repo.outputs.exists == 'false'
         run: |
           REPO_OWNER="${{ github.repository_owner }}"
-          REPO_NAME="${{ matrix.package.repo }}"
-          PACKAGE_NAME="${{ matrix.package.name }}"
+          REPO_NAME="${{ steps.detect.outputs.repo_name }}"
+          PACKAGE_NAME="${{ steps.detect.outputs.package_name }}"
 
-          echo "Creating repository: $REPO_NAME"
+          echo "🏗️ Creating repository: $REPO_NAME"
 
-          # Check if owner is an organization or user
+          # Detect if owner is organization or user
           USER_TYPE=$(curl -s -H "Authorization: token ${{ secrets.REPO_TOKEN }}" \
             "https://api.github.com/users/$REPO_OWNER" | jq -r '.type')
 
@@ -71,56 +121,63 @@ jobs:
             API_URL="https://api.github.com/user/repos"
           fi
 
-          curl -X POST "$API_URL" \
+          RESPONSE=$(curl -s -X POST "$API_URL" \
             -H "Authorization: token ${{ secrets.REPO_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
             -d '{
               "name": "'"$REPO_NAME"'",
-              "description": "Auto-generated '"$PACKAGE_NAME"' package from monorepo",
+              "description": "Auto-split '"$PACKAGE_NAME"' package from monorepo",
               "private": false,
-              "auto_init": false
-            }'
+              "auto_init": false,
+              "has_issues": true,
+              "has_projects": false,
+              "has_wiki": false
+            }')
 
-          echo "Repository created successfully"
+          echo "$RESPONSE"
+          echo "✅ Repository created successfully"
           sleep 5
 
       - name: Split Subtree and Push
         run: |
           REPO_OWNER="${{ github.repository_owner }}"
-          REPO_NAME="${{ matrix.package.repo }}"
-          PACKAGE_PATH="${{ matrix.package.path }}"
-          BRANCH="${{ github.ref_name }}"
+          REPO_NAME="${{ steps.detect.outputs.repo_name }}"
+          PACKAGE_PATH="${{ steps.detect.outputs.package_path }}"
 
-          echo "Splitting $PACKAGE_PATH to $REPO_NAME..."
+          echo "✂️ Splitting $PACKAGE_PATH to $REPO_NAME..."
 
           # Create temporary branch for subtree
-          TEMP_BRANCH="split-${{ matrix.package.name }}-$(date +%s)"
+          TEMP_BRANCH="split-temp-$(date +%s)"
 
           # Split subtree
           git subtree split --prefix="$PACKAGE_PATH" -b "$TEMP_BRANCH"
 
-          # Push to remote repository
+          # Push to remote repository (force update)
           git push -f "https://${{ secrets.REPO_TOKEN }}@github.com/$REPO_OWNER/$REPO_NAME.git" \
-            "$TEMP_BRANCH:$BRANCH"
+            "$TEMP_BRANCH:main"
 
-          # Cleanup temporary branch
+          # Cleanup
           git branch -D "$TEMP_BRANCH"
 
-          echo "Successfully pushed $PACKAGE_PATH to $REPO_NAME"
+          echo "✅ Successfully pushed $PACKAGE_PATH to $REPO_NAME"
 
-      - name: Create Release Tag (if tagged)
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Create and Push Tag
+        if: steps.detect.outputs.should_publish == 'true'
         run: |
           REPO_OWNER="${{ github.repository_owner }}"
-          REPO_NAME="${{ matrix.package.repo }}"
-          TAG_NAME="${{ github.ref_name }}"
+          REPO_NAME="${{ steps.detect.outputs.repo_name }}"
+          VERSION="${{ steps.detect.outputs.version }}"
+          TAG_NAME="v$VERSION"
 
-          echo "Creating tag $TAG_NAME in $REPO_NAME..."
+          echo "🏷️ Creating tag $TAG_NAME in $REPO_NAME..."
 
-          # Get the commit SHA from the subtree
-          COMMIT_SHA=$(git rev-parse HEAD)
+          # Get latest commit SHA from main branch of sub-repo
+          COMMIT_SHA=$(curl -s \
+            -H "Authorization: token ${{ secrets.REPO_TOKEN }}" \
+            "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/git/refs/heads/main" \
+            | jq -r '.object.sha')
 
-          # Create tag in remote repository
+          # Create tag
           curl -X POST \
             -H "Authorization: token ${{ secrets.REPO_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
@@ -128,21 +185,34 @@ jobs:
             -d '{
               "ref": "refs/tags/'"$TAG_NAME"'",
               "sha": "'"$COMMIT_SHA"'"
-            }'
+            }' || echo "Tag may already exist"
 
-          echo "Tag $TAG_NAME created in $REPO_NAME"
+          # Create GitHub Release
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.REPO_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/releases" \
+            -d '{
+              "tag_name": "'"$TAG_NAME"'",
+              "name": "Release '"$VERSION"'",
+              "body": "Auto-generated release from monorepo\n\nCommit: '"${{ github.sha }}"'\nBranch: '"${{ github.ref_name }}"'",
+              "draft": false,
+              "prerelease": false
+            }' || echo "Release may already exist"
+
+          echo "✅ Tag $TAG_NAME created with release"
 
   publish-npm:
-    needs: subtree-split
+    needs: detect-and-split
+    if: needs.detect-and-split.outputs.package_name == 'node' && needs.detect-and-split.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+
     steps:
-      - name: Checkout Node Package
+      - name: Checkout Sub Repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/subtree-split-test-node
+          repository: ${{ github.repository_owner }}/${{ needs.detect-and-split.outputs.repo_name }}
           token: ${{ secrets.REPO_TOKEN }}
-          ref: ${{ github.ref_name }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -150,31 +220,137 @@ jobs:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Publish to NPM
+      - name: Install Dependencies
         run: |
+          if [ -f "package-lock.json" ]; then
+            npm ci
+          else
+            npm install
+          fi
+        continue-on-error: true
+
+      - name: Publish to NPM
+        if: env.NODE_AUTH_TOKEN != ''
+        run: |
+          echo "📦 Publishing to NPM..."
           npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         continue-on-error: true
 
+      - name: NPM Token Warning
+        if: env.NODE_AUTH_TOKEN == ''
+        run: |
+          echo "⚠️ NPM_TOKEN not configured"
+          echo "Add NPM_TOKEN to repository secrets to enable auto-publish"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
   publish-composer:
-    needs: subtree-split
+    needs: detect-and-split
+    if: needs.detect-and-split.outputs.package_name == 'php' && needs.detect-and-split.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+
     steps:
-      - name: Checkout PHP Package
+      - name: Checkout Sub Repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/subtree-split-test-php
+          repository: ${{ github.repository_owner }}/${{ needs.detect-and-split.outputs.repo_name }}
           token: ${{ secrets.REPO_TOKEN }}
-          ref: ${{ github.ref_name }}
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.2"
+          tools: composer
 
       - name: Validate Composer
         run: |
           composer validate --no-check-all --strict
         continue-on-error: true
 
-      - name: Note about Packagist
+      - name: Packagist Info
         run: |
-          echo "Packagist will auto-detect new tags if repository is registered"
-          echo "Register at: https://packagist.org/packages/submit"
+          echo "📦 Packagist Auto-Publish Info:"
+          echo "1. Register once at: https://packagist.org/packages/submit"
+          echo "2. Add GitHub Service Hook for auto-updates"
+          echo "3. New tags will auto-publish to Packagist"
+          echo ""
+          echo "Repository: https://github.com/${{ github.repository_owner }}/${{ needs.detect-and-split.outputs.repo_name }}"
+          echo "Version: v${{ needs.detect-and-split.outputs.version }}"
+
+  create-archive:
+    needs: detect-and-split
+    if: needs.detect-and-split.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Sub Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ needs.detect-and-split.outputs.repo_name }}
+          token: ${{ secrets.REPO_TOKEN }}
+
+      - name: Create Archive
+        run: |
+          PACKAGE_NAME="${{ needs.detect-and-split.outputs.package_name }}"
+          VERSION="${{ needs.detect-and-split.outputs.version }}"
+          ARCHIVE_NAME="${PACKAGE_NAME}-${VERSION}.tar.gz"
+
+          echo "📦 Creating archive: $ARCHIVE_NAME"
+
+          # Create archive excluding .git
+          tar -czf "$ARCHIVE_NAME" --exclude='.git' .
+
+          echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
+
+          ls -lh "$ARCHIVE_NAME"
+
+      - name: Upload Archive to Release
+        run: |
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ needs.detect-and-split.outputs.repo_name }}"
+          VERSION="${{ needs.detect-and-split.outputs.version }}"
+          TAG_NAME="v$VERSION"
+          ARCHIVE_NAME="${{ needs.detect-and-split.outputs.package_name }}-${VERSION}.tar.gz"
+
+          # Get release ID
+          RELEASE_ID=$(curl -s \
+            -H "Authorization: token ${{ secrets.REPO_TOKEN }}" \
+            "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/releases/tags/$TAG_NAME" \
+            | jq -r '.id')
+
+          if [ "$RELEASE_ID" != "null" ]; then
+            echo "📤 Uploading archive to release..."
+            
+            curl -X POST \
+              -H "Authorization: token ${{ secrets.REPO_TOKEN }}" \
+              -H "Content-Type: application/gzip" \
+              --data-binary "@$ARCHIVE_NAME" \
+              "https://uploads.github.com/repos/$REPO_OWNER/$REPO_NAME/releases/$RELEASE_ID/assets?name=$ARCHIVE_NAME"
+            
+            echo "✅ Archive uploaded successfully"
+          else
+            echo "⚠️ Release not found, skipping archive upload"
+          fi
+
+  notify-success:
+    needs: [detect-and-split, publish-npm, publish-composer, create-archive]
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Summary
+        run: |
+          echo "## 🎉 Subtree Split Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Package:** ${{ needs.detect-and-split.outputs.package_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** [${{ needs.detect-and-split.outputs.repo_name }}](https://github.com/${{ github.repository_owner }}/${{ needs.detect-and-split.outputs.repo_name }})" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ needs.detect-and-split.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Published:** ${{ needs.detect-and-split.outputs.should_publish }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Jobs Status:" >> $GITHUB_STEP_SUMMARY
+          echo "- Subtree Split: ${{ needs.detect-and-split.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- NPM Publish: ${{ needs.publish-npm.result || 'skipped' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Composer Publish: ${{ needs.publish-composer.result || 'skipped' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Create Archive: ${{ needs.create-archive.result || 'skipped' }}" >> $GITHUB_STEP_SUMMARY
