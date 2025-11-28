@@ -22,14 +22,130 @@ on:
           - go
 
 jobs:
+  # Job untuk split semua packages dari main branch
+  split-all-from-main:
+    runs-on: ubuntu-latest
+    if: github.ref_name == 'main'
+    strategy:
+      matrix:
+        package:
+          - name: php
+            path: php
+            repo: subtree-split-test-php
+          - name: node
+            path: node
+            repo: subtree-split-test-node
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.REPO_TOKEN }}
+      
+      - name: Setup Git Config
+        run: |
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+      
+      - name: Check Package Directory
+        id: check_dir
+        run: |
+          if [ -d "${{ matrix.package.path }}" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "✅ Directory ${{ matrix.package.path }} exists"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Directory ${{ matrix.package.path }} not found, skipping"
+          fi
+      
+      - name: Check if Remote Repository Exists
+        if: steps.check_dir.outputs.exists == 'true'
+        id: check_repo
+        run: |
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ matrix.package.repo }}"
+          
+          echo "🔍 Checking repository: $REPO_OWNER/$REPO_NAME"
+          
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.REPO_TOKEN }}" \
+            "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME")
+          
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "✅ Repository exists"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "❌ Repository does not exist - will create"
+          fi
+      
+      - name: Create Remote Repository
+        if: steps.check_dir.outputs.exists == 'true' && steps.check_repo.outputs.exists == 'false'
+        run: |
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ matrix.package.repo }}"
+          PACKAGE_NAME="${{ matrix.package.name }}"
+          
+          echo "🏗️ Creating repository: $REPO_NAME"
+          
+          USER_TYPE=$(curl -s -H "Authorization: token ${{ secrets.REPO_TOKEN }}" \
+            "https://api.github.com/users/$REPO_OWNER" | jq -r '.type')
+          
+          if [ "$USER_TYPE" = "Organization" ]; then
+            API_URL="https://api.github.com/orgs/$REPO_OWNER/repos"
+          else
+            API_URL="https://api.github.com/user/repos"
+          fi
+          
+          curl -s -X POST "$API_URL" \
+            -H "Authorization: token ${{ secrets.REPO_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -d '{
+              "name": "'"$REPO_NAME"'",
+              "description": "Auto-split '"$PACKAGE_NAME"' package from monorepo",
+              "private": false,
+              "auto_init": false
+            }'
+          
+          echo "✅ Repository created"
+          sleep 5
+      
+      - name: Subtree Split and Push
+        if: steps.check_dir.outputs.exists == 'true'
+        run: |
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ matrix.package.repo }}"
+          PACKAGE_PATH="${{ matrix.package.path }}"
+          
+          echo "✂️ Splitting $PACKAGE_PATH to $REPO_NAME..."
+          
+          TEMP_BRANCH="split-temp-$(date +%s)"
+          
+          # Split subtree
+          git subtree split --prefix="$PACKAGE_PATH" -b "$TEMP_BRANCH"
+          
+          # Push to remote
+          git push -f "https://${{ secrets.REPO_TOKEN }}@github.com/$REPO_OWNER/$REPO_NAME.git" \
+            "$TEMP_BRANCH:main"
+          
+          # Cleanup
+          git branch -D "$TEMP_BRANCH"
+          
+          echo "✅ Successfully pushed $PACKAGE_PATH to $REPO_NAME"
+
+  # Job untuk direct push dari main-* branches
   detect-and-split:
     runs-on: ubuntu-latest
+    # Hanya jalan untuk branch main-*
+    if: startsWith(github.ref_name, 'main-')
     outputs:
       package_name: ${{ steps.detect.outputs.package_name }}
       package_path: ${{ steps.detect.outputs.package_path }}
       repo_name: ${{ steps.detect.outputs.repo_name }}
       should_publish: ${{ steps.detect.outputs.should_publish }}
       version: ${{ steps.detect.outputs.version }}
+      mode: ${{ steps.detect.outputs.mode }}
     
     steps:
       - name: Checkout Code
@@ -41,29 +157,26 @@ jobs:
       - name: Detect Package from Branch
         id: detect
         run: |
-          # Detect package dari branch name atau manual input
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            PACKAGE="${{ github.event.inputs.package }}"
-          else
-            BRANCH_NAME="${{ github.ref_name }}"
-            PACKAGE="${BRANCH_NAME#main-}"  # Remove "main-" prefix
-          fi
+          BRANCH_NAME="${{ github.ref_name }}"
+          
+          # Extract package name dari main-*
+          PACKAGE="${BRANCH_NAME#main-}"
           
           echo "package_name=$PACKAGE" >> $GITHUB_OUTPUT
           echo "package_path=$PACKAGE" >> $GITHUB_OUTPUT
           echo "repo_name=subtree-split-test-$PACKAGE" >> $GITHUB_OUTPUT
+          echo "mode=direct" >> $GITHUB_OUTPUT
           
-          # Check if should publish (jika ada version bump)
+          # Detect version
           SHOULD_PUBLISH="false"
           VERSION=""
           
           if [ "$PACKAGE" = "node" ]; then
-            if [ -f "node/package.json" ]; then
-              VERSION=$(grep '"version"' node/package.json | head -1 | sed 's/.*"version": "\(.*\)".*/\1/')
+            if [ -f "package.json" ]; then
+              VERSION=$(grep '"version"' package.json | head -1 | sed 's/.*"version": "\(.*\)".*/\1/')
               echo "Detected Node version: $VERSION"
             fi
           elif [ "$PACKAGE" = "php" ]; then
-            # PHP version dari commit message atau generate dari date
             VERSION=$(date +%Y.%m.%d.%H%M)
             echo "Generated PHP version: $VERSION"
           fi
@@ -75,8 +188,9 @@ jobs:
           
           echo "should_publish=$SHOULD_PUBLISH" >> $GITHUB_OUTPUT
           
-          echo "📦 Detected Package: $PACKAGE"
-          echo "📁 Path: $PACKAGE"
+          echo "📦 Branch: $BRANCH_NAME"
+          echo "🎯 Mode: direct"
+          echo "📁 Package: $PACKAGE"
           echo "🔖 Version: $VERSION"
           echo "🚀 Should Publish: $SHOULD_PUBLISH"
       
@@ -145,43 +259,12 @@ jobs:
         run: |
           REPO_OWNER="${{ github.repository_owner }}"
           REPO_NAME="${{ steps.detect.outputs.repo_name }}"
-          PACKAGE_PATH="${{ steps.detect.outputs.package_path }}"
-          BRANCH_NAME="${{ github.ref_name }}"
           
-          echo "📦 Pushing to $REPO_NAME..."
+          echo "📦 Direct push to $REPO_NAME..."
           
-          # Check if we're on a main-* branch (direct push)
-          if [[ "$BRANCH_NAME" == main-* ]]; then
-            echo "✅ Direct push from $BRANCH_NAME (no subtree split needed)"
-            
-            # Push current branch directly to sub-repo
-            git push -f "https://${{ secrets.REPO_TOKEN }}@github.com/$REPO_OWNER/$REPO_NAME.git" \
-              HEAD:main
-              
-          else
-            echo "✂️ Subtree split from $BRANCH_NAME/$PACKAGE_PATH"
-            
-            # Check if path exists
-            if [ ! -d "$PACKAGE_PATH" ]; then
-              echo "❌ Error: Path '$PACKAGE_PATH' does not exist"
-              echo "Available directories:"
-              ls -la
-              exit 1
-            fi
-            
-            # Create temporary branch for subtree
-            TEMP_BRANCH="split-temp-$(date +%s)"
-            
-            # Split subtree
-            git subtree split --prefix="$PACKAGE_PATH" -b "$TEMP_BRANCH"
-            
-            # Push to remote repository
-            git push -f "https://${{ secrets.REPO_TOKEN }}@github.com/$REPO_OWNER/$REPO_NAME.git" \
-              "$TEMP_BRANCH:main"
-            
-            # Cleanup
-            git branch -D "$TEMP_BRANCH"
-          fi
+          # Push current branch directly to sub-repo
+          git push -f "https://${{ secrets.REPO_TOKEN }}@github.com/$REPO_OWNER/$REPO_NAME.git" \
+            HEAD:main
           
           echo "✅ Successfully pushed to $REPO_NAME"
       
